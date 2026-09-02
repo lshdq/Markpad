@@ -137,17 +137,20 @@ export function renderStaticFrontMatterPanel(frontMatter: FrontMatterParseResult
 						.join('')}</div>`
 					: `<span class="frontmatter-static-value">${escapeHtml(field.displayValue)}</span>`;
 
-				return `<div class="frontmatter-key">${key}</div><div class="frontmatter-value">${value}</div>`;
+				return `<dt class="frontmatter-key">${key}</dt><dd class="frontmatter-value">${value}</dd>`;
 			})
 			.join('')
+		: '';
+	const content = frontMatter.valid
+		? `<dl class="frontmatter-grid">${rows}</dl>`
 		: `<div class="frontmatter-error">${escapeHtml(frontMatter.error || 'Invalid frontmatter')}</div>`;
 
-	return `<details class="frontmatter-panel export-frontmatter-panel">
+	return `<details class="frontmatter-panel export-frontmatter-panel" open>
 <summary class="frontmatter-summary">
 <span class="frontmatter-chevron" aria-hidden="true">›</span>
 <span class="frontmatter-title">Properties</span>
 <span class="frontmatter-count">${count}</span>
 </summary>
-<div class="frontmatter-grid">${rows}</div>
+${content}
 </details>`;
 }

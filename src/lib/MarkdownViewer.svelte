@@ -12,6 +12,7 @@
 	import DiffOverlay from './components/DiffOverlay.svelte';
 	import Editor from './components/Editor.svelte';
 	import EditorToolbar from './components/EditorToolbar.svelte';
+	import FrontMatterPanel from './components/FrontMatterPanel.svelte';
 	import Modal from './components/Modal.svelte';
 	import UpdateDialog from './components/UpdateDialog.svelte';
 	import { updateStore } from './stores/update.svelte.js';
@@ -70,15 +71,8 @@ import {
 	type RendererLine,
 } from './utils/lineCoordinates.js';
 import {
-	addFrontMatterListItems,
 	getMarkdownBodyWithoutFrontMatter,
-	getFrontMatterListItems,
 	parseFrontMatter,
-	parseFrontMatterEditableValue,
-	removeFrontMatterListItem,
-	updateFrontMatterListItem,
-	updateFrontMatterField,
-	type FrontMatterField,
 } from './utils/frontMatter.js';
 import {
 	decodeLinkPath,
@@ -313,11 +307,7 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 	let currentFile = $derived(tabManager.activeTab?.path ?? '');
 	let frontMatterPanelKey = $derived(currentFile || tabManager.activeTabId || 'untitled');
 	let frontMatterCollapsedByKey = $state<Record<string, boolean>>({});
-	let frontMatterEditErrors = $state<Record<string, string>>({});
-	let frontMatterTagDrafts = $state<Record<string, string>>({});
-	let frontMatterTagEditIndexes = $state<Record<string, number | null>>({});
-	let frontMatterTagEditDrafts = $state<Record<string, string>>({});
-	let isFrontMatterCollapsed = $derived(frontMatterCollapsedByKey[frontMatterPanelKey] ?? true);
+	let isFrontMatterCollapsed = $derived(frontMatterCollapsedByKey[frontMatterPanelKey] ?? false);
 	let isMarkdown = $derived(hasMarkdownLinkExtension(currentFile));
 	let editorLanguage = $derived(getLanguage(currentFile));
 	let htmlContent = $derived(tabManager.activeTab?.content ?? '');
@@ -935,23 +925,8 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 		await tick();
 	}
 
-	function frontMatterFieldId(key: string) {
-		return `frontmatter-${key.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
-	}
-
-	function frontMatterFieldStateKey(field: FrontMatterField) {
-		return `${frontMatterPanelKey}:${field.key}`;
-	}
-
-	function tagsEqual(left: string[], right: string[]) {
-		return left.length === right.length && left.every((value, index) => value === right[index]);
-	}
-
-	function focusAndSelect(node: HTMLInputElement) {
-		requestAnimationFrame(() => {
-			node.focus();
-			node.select();
-		});
+	async function loadMarkdown(filePath: string, options: LoadMarkdownOptions = {}) {
+		return documentSession.loadMarkdown(filePath, options);
 	}
 
 	function setFrontMatterCollapsed(collapsed: boolean) {
@@ -959,187 +934,6 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 			...frontMatterCollapsedByKey,
 			[frontMatterPanelKey]: collapsed,
 		};
-	}
-
-	function clearFrontMatterEditError(field: FrontMatterField) {
-		const key = frontMatterFieldStateKey(field);
-		if (!frontMatterEditErrors[key]) return;
-		const next = { ...frontMatterEditErrors };
-		delete next[key];
-		frontMatterEditErrors = next;
-	}
-
-	async function handleFrontMatterEdit(field: FrontMatterField, value: string) {
-		const tab = tabManager.activeTab;
-		if (!tab) return;
-		// Front matter is editable from reading mode, which a large file can
-		// reach while its buffer is still the preview slice. Rewriting that
-		// slice and saving it would drop the rest of the document.
-		if (!(await documentSession.ensureFullContent(tab.id))) {
-			addToast(t('toast.partialDocument', settings.language), 'error');
-			return;
-		}
-
-		try {
-			const nextValue = parseFrontMatterEditableValue(field, value);
-			const nextRaw = updateFrontMatterField(tab.rawContent, field.key, nextValue);
-			tabManager.updateTabRawContent(tab.id, nextRaw);
-			clearFrontMatterEditError(field);
-			await renderTabPreviewFromRaw(tab);
-		} catch (error) {
-			frontMatterEditErrors = {
-				...frontMatterEditErrors,
-				[frontMatterFieldStateKey(field)]: String(error),
-			};
-		}
-	}
-
-	function getFrontMatterTagDraft(field: FrontMatterField) {
-		return frontMatterTagDrafts[frontMatterFieldStateKey(field)] ?? '';
-	}
-
-	function setFrontMatterTagDraft(field: FrontMatterField, value: string) {
-		frontMatterTagDrafts = {
-			...frontMatterTagDrafts,
-			[frontMatterFieldStateKey(field)]: value,
-		};
-		clearFrontMatterEditError(field);
-	}
-
-	function clearFrontMatterTagDraft(field: FrontMatterField) {
-		const key = frontMatterFieldStateKey(field);
-		if (!frontMatterTagDrafts[key]) return;
-
-		const next = { ...frontMatterTagDrafts };
-		delete next[key];
-		frontMatterTagDrafts = next;
-	}
-
-	function getFrontMatterTagEditIndex(field: FrontMatterField) {
-		return frontMatterTagEditIndexes[frontMatterFieldStateKey(field)] ?? null;
-	}
-
-	function getFrontMatterTagEditDraft(field: FrontMatterField, fallback: string) {
-		return frontMatterTagEditDrafts[frontMatterFieldStateKey(field)] ?? fallback;
-	}
-
-	function setFrontMatterTagEditDraft(field: FrontMatterField, value: string) {
-		frontMatterTagEditDrafts = {
-			...frontMatterTagEditDrafts,
-			[frontMatterFieldStateKey(field)]: value,
-		};
-		clearFrontMatterEditError(field);
-	}
-
-	function startFrontMatterTagEdit(field: FrontMatterField, index: number, value: string) {
-		const key = frontMatterFieldStateKey(field);
-		frontMatterTagEditIndexes = {
-			...frontMatterTagEditIndexes,
-			[key]: index,
-		};
-		frontMatterTagEditDrafts = {
-			...frontMatterTagEditDrafts,
-			[key]: value,
-		};
-		clearFrontMatterEditError(field);
-	}
-
-	function clearFrontMatterTagEdit(field: FrontMatterField) {
-		const key = frontMatterFieldStateKey(field);
-		const nextIndexes = { ...frontMatterTagEditIndexes };
-		const nextDrafts = { ...frontMatterTagEditDrafts };
-		delete nextIndexes[key];
-		delete nextDrafts[key];
-		frontMatterTagEditIndexes = nextIndexes;
-		frontMatterTagEditDrafts = nextDrafts;
-	}
-
-	async function handleFrontMatterListChange(field: FrontMatterField, nextItems: string[]) {
-		const tab = tabManager.activeTab;
-		if (!tab) return;
-		// Same partial-buffer guard as handleFrontMatterEdit.
-		if (!(await documentSession.ensureFullContent(tab.id))) {
-			addToast(t('toast.partialDocument', settings.language), 'error');
-			return;
-		}
-
-		try {
-			const nextRaw = updateFrontMatterField(tab.rawContent, field.key, nextItems);
-			tabManager.updateTabRawContent(tab.id, nextRaw);
-			clearFrontMatterEditError(field);
-			await renderTabPreviewFromRaw(tab);
-		} catch (error) {
-			frontMatterEditErrors = {
-				...frontMatterEditErrors,
-				[frontMatterFieldStateKey(field)]: String(error),
-			};
-		}
-	}
-
-	async function commitFrontMatterTagAdd(field: FrontMatterField) {
-		const draft = getFrontMatterTagDraft(field);
-		if (!draft.trim()) return;
-
-		const currentItems = getFrontMatterListItems(field);
-		const nextItems = addFrontMatterListItems(currentItems, [draft]);
-		if (tagsEqual(currentItems, nextItems)) {
-			clearFrontMatterTagDraft(field);
-			return;
-		}
-
-		await handleFrontMatterListChange(field, nextItems);
-		clearFrontMatterTagDraft(field);
-	}
-
-	async function removeFrontMatterTag(field: FrontMatterField, index: number) {
-		const currentItems = getFrontMatterListItems(field);
-		const nextItems = removeFrontMatterListItem(currentItems, index);
-		if (tagsEqual(currentItems, nextItems)) return;
-
-		await handleFrontMatterListChange(field, nextItems);
-	}
-
-	async function commitFrontMatterTagEdit(field: FrontMatterField, index: number) {
-		if (getFrontMatterTagEditIndex(field) !== index) return;
-
-		const draft = getFrontMatterTagEditDraft(field, '');
-		const currentItems = getFrontMatterListItems(field);
-		const nextItems = updateFrontMatterListItem(currentItems, index, draft);
-
-		clearFrontMatterTagEdit(field);
-		if (tagsEqual(currentItems, nextItems)) return;
-
-		await handleFrontMatterListChange(field, nextItems);
-	}
-
-	function handleFrontMatterTagAddKeydown(event: KeyboardEvent, field: FrontMatterField) {
-		if (event.key === 'Enter' || event.key === ',') {
-			event.preventDefault();
-			void commitFrontMatterTagAdd(field);
-			return;
-		}
-
-		if (event.key === 'Escape') {
-			event.preventDefault();
-			clearFrontMatterTagDraft(field);
-		}
-	}
-
-	function handleFrontMatterTagEditKeydown(event: KeyboardEvent, field: FrontMatterField, index: number) {
-		if (event.key === 'Enter') {
-			event.preventDefault();
-			void commitFrontMatterTagEdit(field, index);
-			return;
-		}
-
-		if (event.key === 'Escape') {
-			event.preventDefault();
-			clearFrontMatterTagEdit(field);
-		}
-	}
-
-	async function loadMarkdown(filePath: string, options: LoadMarkdownOptions = {}) {
-		return documentSession.loadMarkdown(filePath, options);
 	}
 
 	function currentMermaidTheme() {
@@ -3809,107 +3603,10 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 									}}
 									tabindex="-1"
 									style="outline: none; font-family: {settings.previewFont}, sans-serif; font-size: {settings.previewFontSize}px; flex: 1; --preview-max-width: {previewContentWidth === null ? '100%' : `${previewContentWidth}px`};">
-									{#if frontMatterInfo.exists}
-										<details
-											class="frontmatter-panel"
-											class:is-collapsed={isFrontMatterCollapsed}
-											open={!isFrontMatterCollapsed}
-											ontoggle={(e) => setFrontMatterCollapsed(!(e.currentTarget as HTMLDetailsElement).open)}>
-											<summary class="frontmatter-summary">
-												<span class="frontmatter-chevron" aria-hidden="true">›</span>
-												<span class="frontmatter-title">Properties</span>
-												<span class="frontmatter-count">{frontMatterInfo.valid ? frontMatterInfo.fields.length : 0}</span>
-											</summary>
-
-											{#if frontMatterInfo.valid}
-												<div class="frontmatter-grid">
-													{#each frontMatterInfo.fields as field (field.key)}
-														<label class="frontmatter-key" for={frontMatterFieldId(field.key)}>{field.key}</label>
-														<div class="frontmatter-value">
-															{#if field.editable}
-																{#if field.kind === 'boolean'}
-																	<select
-																		id={frontMatterFieldId(field.key)}
-																		value={String(field.value)}
-																		onchange={(e) => handleFrontMatterEdit(field, (e.currentTarget as HTMLSelectElement).value)}>
-																		<option value="true">true</option>
-																		<option value="false">false</option>
-																	</select>
-																{:else if field.kind === 'list'}
-																	<div class="frontmatter-tags">
-																		<div class="frontmatter-tag-list" role="list" aria-label={`${field.key} tags`}>
-																			{#each getFrontMatterListItems(field) as tag, index (`${tag}-${index}`)}
-																				<span class="frontmatter-tag" role="listitem">
-																					{#if getFrontMatterTagEditIndex(field) === index}
-																						<input
-																							class="frontmatter-tag-edit-input"
-																							type="text"
-																							value={getFrontMatterTagEditDraft(field, tag)}
-																							aria-label={`Edit ${field.key} tag ${tag}`}
-																							use:focusAndSelect
-																							oninput={(e) => setFrontMatterTagEditDraft(field, (e.currentTarget as HTMLInputElement).value)}
-																							onkeydown={(e) => handleFrontMatterTagEditKeydown(e, field, index)}
-																							onblur={() => commitFrontMatterTagEdit(field, index)} />
-																					{:else}
-																						<button
-																							class="frontmatter-tag-text"
-																							type="button"
-																							aria-label={`Edit ${field.key} tag ${tag}`}
-																							onclick={() => startFrontMatterTagEdit(field, index, tag)}>
-																							{tag}
-																						</button>
-																						<button
-																							class="frontmatter-tag-remove"
-																							type="button"
-																							aria-label={`Remove ${tag} from ${field.key}`}
-																							onclick={() => removeFrontMatterTag(field, index)}>
-																							×
-																						</button>
-																					{/if}
-																				</span>
-																			{/each}
-																		</div>
-																		<div class="frontmatter-tag-add">
-																			<input
-																				id={frontMatterFieldId(field.key)}
-																				type="text"
-																				value={getFrontMatterTagDraft(field)}
-																				placeholder="Add tag"
-																				autocomplete="off"
-																				enterkeyhint="done"
-																				oninput={(e) => setFrontMatterTagDraft(field, (e.currentTarget as HTMLInputElement).value)}
-																				onkeydown={(e) => handleFrontMatterTagAddKeydown(e, field)} />
-																			<button
-																				class="frontmatter-tag-add-button"
-																				type="button"
-																				aria-label={`Add ${field.key} tag`}
-																				onclick={() => commitFrontMatterTagAdd(field)}>
-																				+
-																			</button>
-																		</div>
-																	</div>
-																{:else}
-																	<input
-																		id={frontMatterFieldId(field.key)}
-																		type={field.kind === 'number' ? 'number' : 'text'}
-																		value={field.displayValue}
-																		onchange={(e) => handleFrontMatterEdit(field, (e.currentTarget as HTMLInputElement).value)} />
-																{/if}
-															{:else}
-																<code>{field.displayValue}</code>
-															{/if}
-															{#if frontMatterEditErrors[frontMatterFieldStateKey(field)]}
-																<div class="frontmatter-field-error" role="status">{frontMatterEditErrors[frontMatterFieldStateKey(field)]}</div>
-															{/if}
-														</div>
-													{/each}
-												</div>
-											{:else}
-												<div class="frontmatter-error" role="status">{frontMatterInfo.error}</div>
-											{/if}
-
-										</details>
-									{/if}
+									<FrontMatterPanel
+										frontMatter={frontMatterInfo}
+										collapsed={isFrontMatterCollapsed}
+										oncollapsedchange={setFrontMatterCollapsed} />
 									<!-- Filled by the block patch, not by Svelte: see `previewBlocks`. -->
 									<div class="markdown-blocks" bind:this={previewBlocks}></div>
 								</article>

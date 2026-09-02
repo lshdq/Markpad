@@ -7,7 +7,6 @@ export type FrontMatterField = {
 	value: unknown;
 	kind: FrontMatterValueKind;
 	displayValue: string;
-	editable: boolean;
 };
 
 export type FrontMatterParseResult = {
@@ -98,7 +97,6 @@ function toField([key, value]: [string, unknown]): FrontMatterField {
 		value,
 		kind,
 		displayValue: stringifyDisplayValue(value),
-		editable: kind !== 'object',
 	};
 }
 
@@ -174,70 +172,9 @@ export function frontMatterLineOffset(content: string): number {
 	return content.slice(0, content.length - body.length).split('\n').length - 1;
 }
 
-export function parseFrontMatterEditableValue(field: FrontMatterField, value: string): unknown {
-	const trimmed = value.trim();
-	switch (field.kind) {
-		case 'boolean':
-			return trimmed.toLowerCase() === 'true';
-		case 'number': {
-			const parsed = Number(trimmed);
-			return Number.isFinite(parsed) ? parsed : value;
-		}
-		case 'list':
-			return parseFrontMatterTagInput(value);
-		case 'null':
-			return trimmed === '' ? null : value;
-		case 'string':
-		default:
-			return value;
-	}
-}
-
-export function updateFrontMatterField(content: string, key: string, value: unknown): string {
-	const parsed = parseFrontMatter(content);
-	if (!parsed.exists) return content;
-	if (!parsed.valid) throw new Error(parsed.error || 'Invalid front matter');
-
-	const doc = parseDocument(parsed.raw, { prettyErrors: false });
-	if (doc.errors.length > 0) throw new Error(doc.errors.map((error) => error.message).join('\n'));
-
-	doc.set(key, value);
-	let serialized = doc.toString({ lineWidth: 0 }).trimEnd();
-	if (parsed.lineEnding === '\r\n') serialized = serialized.replace(/\n/g, '\r\n');
-
-	return `---${parsed.lineEnding}${serialized}${parsed.lineEnding}---${parsed.lineEnding}${parsed.lineEnding}${parsed.body}`;
-}
-
-function parseFrontMatterTagInput(value: string): string[] {
-	return value
-		.split(',')
-		.map((item) => item.trim())
-		.filter(Boolean);
-}
-
 export function getFrontMatterListItems(field: FrontMatterField): string[] {
 	if (!Array.isArray(field.value)) return [];
 	return field.value
 		.map((item) => stringifyDisplayValue(item).trim())
 		.filter(Boolean);
-}
-
-export function addFrontMatterListItems(items: string[], values: string[]): string[] {
-	return [...new Set([...items, ...values.flatMap(parseFrontMatterTagInput)])];
-}
-
-export function removeFrontMatterListItem(items: string[], index: number): string[] {
-	if (index < 0 || index >= items.length) return items;
-	return items.filter((_, itemIndex) => itemIndex !== index);
-}
-
-export function updateFrontMatterListItem(items: string[], index: number, value: string): string[] {
-	if (index < 0 || index >= items.length) return items;
-
-	const trimmed = value.trim();
-	if (!trimmed || items.some((item, itemIndex) => itemIndex !== index && item === trimmed)) return items;
-
-	const next = [...items];
-	next[index] = trimmed;
-	return next;
 }

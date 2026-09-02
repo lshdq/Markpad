@@ -10,6 +10,7 @@ import {
 	rewriteMarkdownHrefForExport,
 } from '../src/lib/utils/exportHtml.js';
 import { resolveMarkdownTargetPath } from '../src/lib/utils/markdownLinks.js';
+import { readSource } from './sourceTree.js';
 
 test('normalizeAssetPath decodes Tauri asset URLs for Windows drive paths and UNC paths', () => {
 	assert.equal(
@@ -107,7 +108,7 @@ test('rewriteMarkdownHrefForExport rewrites local Markdown links and preserves q
 	assert.equal(rewriteMarkdownHrefForExport('mailto:test@example.test'), 'mailto:test@example.test');
 });
 
-test('renderStaticFrontMatterPanel exports a collapsed, non-interactive properties block', () => {
+test('renderStaticFrontMatterPanel exports an expanded, non-interactive properties block', () => {
 	const parsed = parseFrontMatter(`---
 type: plan
 keywords: [logger, synlog]
@@ -119,11 +120,35 @@ draft: false
 
 	const html = renderStaticFrontMatterPanel(parsed);
 
-	assert.match(html, /<details class="frontmatter-panel export-frontmatter-panel">/);
+	assert.match(html, /<details class="frontmatter-panel export-frontmatter-panel" open>/);
 	assert.match(html, /<summary class="frontmatter-summary">/);
 	assert.match(html, /<span class="frontmatter-title">Properties<\/span>/);
+	assert.match(html, /<dl class="frontmatter-grid">/);
+	assert.match(html, /<dt class="frontmatter-key">type<\/dt><dd class="frontmatter-value">/);
 	assert.match(html, /<span class="frontmatter-tag">logger<\/span>/);
 	assert.match(html, /<span class="frontmatter-tag">synlog<\/span>/);
-	assert.doesNotMatch(html, /\sopen(?:\s|>)/);
 	assert.doesNotMatch(html, /<(?:input|button|textarea|select)\b/i);
+});
+
+test('exported properties allow static values and tags to wrap', () => {
+	const source = readSource('src/lib/utils/export.ts');
+	const desktopGrid = source.indexOf('.export-frontmatter-panel .frontmatter-grid {');
+	const mobileGrid = source.indexOf('@media (max-width: 720px) {', desktopGrid);
+
+	assert.match(source, /\.export-frontmatter-panel \.frontmatter-static-value \{[\s\S]*?white-space:\s*pre-wrap;[\s\S]*?overflow-wrap:\s*anywhere;/);
+	assert.match(source, /\.export-frontmatter-panel \.frontmatter-tag \{[\s\S]*?white-space:\s*normal;[\s\S]*?overflow-wrap:\s*anywhere;/);
+	assert.match(source, /@media \(max-width: 720px\) \{[\s\S]*?\.export-frontmatter-panel \.frontmatter-grid \{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/);
+	assert.ok(mobileGrid > desktopGrid, 'the mobile export override must follow the desktop grid rule');
+});
+
+test('invalid front matter exports its error outside a description list', () => {
+	const parsed = parseFrontMatter(`---
+title: [broken
+---
+`);
+	const html = renderStaticFrontMatterPanel(parsed);
+
+	assert.match(html, /<details class="frontmatter-panel export-frontmatter-panel" open>/);
+	assert.match(html, /<div class="frontmatter-error">[^<]+<\/div>/);
+	assert.doesNotMatch(html, /<dl\b/);
 });

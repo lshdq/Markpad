@@ -211,16 +211,34 @@ html, body {
 	color: var(--color-fg-muted, #57606a);
 	font-weight: 600;
 }
+.export-frontmatter-panel .frontmatter-value {
+	min-width: 0;
+}
+.export-frontmatter-panel .frontmatter-static-value {
+	display: block;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
 .export-frontmatter-panel .frontmatter-tags {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
+	min-width: 0;
 }
 .export-frontmatter-panel .frontmatter-tag {
+	max-width: 100%;
+	min-width: 0;
 	border: 1px solid var(--color-border-default, #d0d7de);
 	border-radius: 999px;
 	padding: 2px 8px;
 	background: var(--color-neutral-muted, rgba(175, 184, 193, 0.2));
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+@media (max-width: 720px) {
+	.export-frontmatter-panel .frontmatter-grid {
+		grid-template-columns: minmax(0, 1fr);
+	}
 }
 .markdown-body pre {
 	white-space: pre-wrap !important;
