@@ -20,3 +20,7 @@ dist/
 # Downloaded by the snap jobs; snapcraft.yaml packages it. Never committed.
 markpad.deb
 pack.log
+
+# 仓库内的 OpenCode 指令覆盖开发环境的全局忽略规则。
+!/.opencode/
+!/.opencode/AGENTS.md

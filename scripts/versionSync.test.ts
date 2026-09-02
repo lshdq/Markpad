@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { readSource } from './sourceTree.js';
 
-// `package.json` and `src-tauri/Cargo.toml` are the two files AGENTS.md tells
+// `package.json` and `src-tauri/Cargo.toml` are the two files the project instructions tell
 // you to bump. `src-tauri/Cargo.lock` is the third, and it is the one that gets
 // forgotten: nothing in the editing loop reads it, so a bump lands green and
 // stays wrong until someone runs `cargo build` — which rewrites the one line to
@@ -55,5 +55,5 @@ test('one command writes the version, and the runbook names it', () => {
 
 	// And the runbook points at the command rather than at the two files.
 	assert.match(readSource('RELEASING.md'), /npm run release X\.Y\.Z/);
-	assert.match(readSource('AGENTS.md'), /npm run release X\.Y\.Z/);
+	assert.match(readSource('.opencode/AGENTS.md'), /npm run release X\.Y\.Z/);
 });
