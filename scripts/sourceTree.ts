@@ -65,6 +65,11 @@ export function readSource(path: string | URL): string {
 	return readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
 }
 
+/** Raw bytes for tests whose contract is the repository file encoding itself. */
+export function readSourceBytes(path: string | URL): Buffer {
+	return readFileSync(path);
+}
+
 /**
  * `source` from the first occurrence of `start` onwards.
  *
