@@ -18,6 +18,8 @@ Markpad 会将 Markdown 文档开头由两行 `---` 包围的 YAML front matter 
 6. 用户仍可通过 Properties 标题栏手动展开或收起面板。
 7. 用户手动设置的展开状态继续按当前文档隔离保存于本次应用会话中。
 8. HTML 导出的 Properties 面板默认展开、保持只读，并支持长属性值自动换行。
+9. Properties 面板是否显示必须只取决于当前活动文档，不能受首个打开文档是否包含 front matter 影响。
+10. 在无 front matter 与有 front matter 的文档间切换时，Properties 面板必须随活动文档正确消失或重新显示。
 
 ### 边界与约束
 
@@ -28,6 +30,7 @@ Markpad 会将 Markdown 文档开头由两行 `---` 包围的 YAML front matter 
 5. Properties 面板不再提供任何修改 Markdown 原文的入口；用户需要在 Markdown 编辑器中修改 front matter。
 6. 不持久化 Properties 展开状态到设置文件或磁盘，继续沿用组件会话内、按文档隔离的状态模型。
 7. 桌面宽度和移动端窄屏布局均需完整显示属性值。
+8. 不修改文档加载顺序、标签页内容状态或 front matter 解析结果，仅修正 Properties 组件的条件挂载生命周期。
 
 ## 输入输出
 
@@ -72,3 +75,5 @@ HTML 导出输出：带 `open` 属性的 Properties `<details>` 元素，其中�
 6. Properties 中的任何操作都不会修改 `rawContent` 或令标签页变为 dirty。
 7. 导出的 HTML 中 Properties 默认展开，不含表单控件，并具备自动换行样式。
 8. front matter 解析、Markdown 正文渲染、滚动同步及无效 front matter 错误展示的现有测试继续通过。
+9. 首个打开的文档不含 front matter 时，后续打开含合法 front matter 的文档仍显示 Properties 面板。
+10. 从无 front matter 文档切换到有 front matter 文档时显示面板，切回时隐藏，再次切回时重新显示并恢复该文档的折叠状态。

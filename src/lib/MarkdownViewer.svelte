@@ -3603,10 +3603,12 @@ import { createDocumentSession, type LoadMarkdownOptions } from './sessions/docu
 									}}
 									tabindex="-1"
 									style="outline: none; font-family: {settings.previewFont}, sans-serif; font-size: {settings.previewFontSize}px; flex: 1; --preview-max-width: {previewContentWidth === null ? '100%' : `${previewContentWidth}px`};">
-									<FrontMatterPanel
-										frontMatter={frontMatterInfo}
-										collapsed={isFrontMatterCollapsed}
-										oncollapsedchange={setFrontMatterCollapsed} />
+									{#if frontMatterInfo.exists}
+										<FrontMatterPanel
+											frontMatter={frontMatterInfo}
+											collapsed={isFrontMatterCollapsed}
+											oncollapsedchange={setFrontMatterCollapsed} />
+									{/if}
 									<!-- Filled by the block patch, not by Svelte: see `previewBlocks`. -->
 									<div class="markdown-blocks" bind:this={previewBlocks}></div>
 								</article>
