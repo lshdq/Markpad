@@ -27,8 +27,10 @@ test('the main window is shown without being activated on a cold start', () => {
 	// `set_focus` having been deleted outright.
 	assert.match(showWindow, /set_focus\(\)/);
 
-	// And the quiet path returns before reaching it.
-	const guard = showWindow.indexOf('return;');
+	// And the quiet path returns before reaching it. (The command returns a
+	// Result because tauri requires one once an async command takes a State
+	// reference — the early return is still the cold-start exit.)
+	const guard = showWindow.indexOf('return Ok(());');
 	const focus = showWindow.indexOf('set_focus()');
 	assert.ok(guard > 0 && guard < focus, 'the cold-start path falls through to set_focus');
 });

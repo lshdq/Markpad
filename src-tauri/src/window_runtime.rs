@@ -1,6 +1,8 @@
 use crate::fs_safety::atomic_write;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +11,7 @@ use std::sync::{
     Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_window_state::AppHandleExt;
 
 pub struct WatcherState {
     pub(crate) watchers: Mutex<HashMap<String, RecommendedWatcher>>,
@@ -27,6 +30,15 @@ pub struct AppState {
     pub(crate) last_focused_viewer: Mutex<Option<String>>,
     window_registry: Mutex<HashMap<String, WindowMeta>>,
     window_counter: AtomicU64,
+    /// Windows-only mechanism (populated and consumed there): labels of
+    /// windows that `show_window` must maximize itself, quietly, after its
+    /// show — because no tao path maximizes without activating (#702).
+    /// One-shot: `show_window` removes the label it consumes. See
+    /// `note_pending_quiet_maximize` / `quiet_maximize`. The field itself is
+    /// cfg-gated: off Windows every reader compiles away, and an unread
+    /// field would fail clippy's dead_code check there.
+    #[cfg(target_os = "windows")]
+    pub(crate) pending_quiet_maximize: Mutex<HashSet<String>>,
     /// Serialises the read-modify-write cycle over `pinned-tags.json`. Guards
     /// a critical section rather than a value, so the payload is `()` — see
     /// `update_pinned_tags` for why the whole cycle has to be inside it.
@@ -58,6 +70,8 @@ impl AppState {
             last_focused_viewer: Mutex::new(None),
             window_registry: Mutex::new(HashMap::new()),
             window_counter: AtomicU64::new(0),
+            #[cfg(target_os = "windows")]
+            pending_quiet_maximize: Mutex::new(HashSet::new()),
             pinned_tags: Mutex::new(()),
         }
     }
@@ -371,18 +385,47 @@ static MAIN_WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 /// bringing its window up so the dialog is not hidden behind another — and each
 /// of those must still come to the front.
 #[tauri::command]
-pub async fn show_window(window: tauri::Window) {
+pub async fn show_window(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
     let is_cold_start =
         window.label() == "main" && !MAIN_WINDOW_SHOWN.swap(true, Ordering::Relaxed);
 
-    let _ = window.show();
+    #[cfg(target_os = "windows")]
+    let needs_quiet_maximize = lock_recover(&state.pending_quiet_maximize).remove(window.label());
+    #[cfg(not(target_os = "windows"))]
+    let needs_quiet_maximize = {
+        let _ = &state;
+        false
+    };
+
+    if needs_quiet_maximize {
+        // The show and the maximization must happen in one event-loop turn:
+        // tao's set_visible posts itself to the main thread and returns, so a
+        // maximize issued from here could land BEFORE the show (a hidden
+        // window ignores it, and tao's show would then strip the style bit).
+        // One main-thread closure makes the order certain and leaves no frame
+        // in which the window is visible at its restore-rect size. The
+        // command thread waits on the channel so `unminimize`/`set_focus`
+        // below still run after the window is actually up.
+        let window2 = window.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = window.run_on_main_thread(move || {
+            let _ = window2.show();
+            #[cfg(target_os = "windows")]
+            quiet_maximize(&window2);
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+    } else {
+        let _ = window.show();
+    }
 
     if is_cold_start {
-        return;
+        return Ok(());
     }
 
     let _ = window.unminimize();
     let _ = window.set_focus();
+    Ok(())
 }
 
 fn window_state_path(app: &AppHandle) -> Result<std::path::PathBuf, crate::error::Error> {
@@ -494,6 +537,293 @@ pub fn bring_to_front(window: &tauri::WebviewWindow) {
     let _ = window.set_focus();
 }
 
+// ---------------------------------------------------------------------
+// Builder-time window geometry restore
+//
+// The window-state plugin only SAVES for Markpad's windows; restoring is
+// done here, at builder time. The plugin's own `restore_state` cannot be
+// used: its `on_window_ready` runs inline inside `build()` on the main
+// thread and ends with `show()` + `set_focus()` — an empty window on
+// screen, and stolen focus, long before the frontend's `show_window` is
+// meant to reveal it (#702). Its `maximize()` on a still-hidden window is
+// worse: tao's `apply_diff` answers it with `SW_MAXIMIZE` followed by
+// `SW_HIDE` — a maximized empty frame that flashes and activates.
+//
+// Nor can the builder carry the maximization on Windows: tao's
+// `with_maximized` is documented inside tao as set "after the window has
+// been configured" — the same post-creation `set_maximized`, the same
+// `SW_MAXIMIZE` → `SW_HIDE`. And tao's quiet show (`SW_SHOWNOACTIVATE`)
+// does not survive maximization either: its `apply_diff` fires
+// `SW_MAXIMIZE` unconditionally whenever the shown window's flags contain
+// MAXIMIZED. So on Windows maximization is deferred past the quiet show
+// entirely — see `quiet_maximize`. Off Windows the builder's
+// `with_maximized` is side-effect free on a hidden window (macOS `zoom:`
+// does not reveal it, gtk maximizes without showing), so it is used there.
+//
+// The plugin has no public read API for the state it saved, so this reads
+// its `.window-state.json` directly. The parse is defensive to match the
+// coupling: every field optional, unknown fields ignored, any damage reads
+// as "no saved state" and the window falls back to its builder defaults.
+// `DEFAULT_FILENAME` keeps the filename honest, and a source-contract test
+// (`startupWindowGeometry.test.ts`) pins that the plugin builder never
+// sets `with_filename`.
+
+/// A monitor rectangle plus its scale factor: `(x, y, width, height, scale)`.
+type MonitorRect = (i32, i32, u32, u32, f64);
+
+/// What a window should look like once revealed, recovered from the save
+/// file before the window is built.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartupGeometry {
+    /// Normal (restore) size in physical pixels; `None` = builder default.
+    pub size: Option<(u32, u32)>,
+    /// Normal (restore) position in physical pixels; `None` = centered or
+    /// OS-placed, because no live monitor reports containing the saved rect.
+    pub position: Option<(i32, i32)>,
+    pub maximized: bool,
+    pub fullscreen: bool,
+    /// Scale factor of the monitor the saved rect sits on. The builder API
+    /// takes logical units, so the maximized restore rect converts through
+    /// this; 1.0 when no monitor matched.
+    pub scale_factor: f64,
+}
+
+impl Default for StartupGeometry {
+    fn default() -> Self {
+        Self {
+            size: None,
+            position: None,
+            maximized: false,
+            fullscreen: false,
+            scale_factor: 1.0,
+        }
+    }
+}
+
+/// Mirror of the plugin's `WindowState` entry. `visible` and `decorated`
+/// are deliberately absent: visibility is owned by `show_window`, and
+/// decorations are a per-platform constant here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+struct SavedWindowState {
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    prev_x: i32,
+    prev_y: i32,
+    maximized: bool,
+    fullscreen: bool,
+}
+
+fn parse_saved_window_state(json: &str, label: &str) -> Option<SavedWindowState> {
+    let mut states: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).ok()?;
+    serde_json::from_value(states.remove(label)?).ok()
+}
+
+/// The plugin's `MonitorExt::intersects`: a saved rect "exists" when any of
+/// its four corners lands in a live monitor — the check that keeps a window
+/// from being restored onto a monitor that is no longer there.
+fn saved_rect_intersects_monitor(
+    position: (i32, i32),
+    size: (u32, u32),
+    monitor: MonitorRect,
+) -> bool {
+    // i64 arithmetic: the file is user-writable JSON, so a hand-crafted
+    // u32::MAX width or i32::MIN position must not wrap the corner math
+    // (the plugin's own `intersects` has the same overflow in i32; there is
+    // no reason to inherit it).
+    let (px, py) = (i64::from(position.0), i64::from(position.1));
+    let (w, h) = (i64::from(size.0), i64::from(size.1));
+    let (mx, my) = (i64::from(monitor.0), i64::from(monitor.1));
+    let (right, bottom) = (mx + i64::from(monitor.2), my + i64::from(monitor.3));
+    [(px, py), (px + w, py), (px, py + h), (px + w, py + h)]
+        .into_iter()
+        .any(|(x, y)| x >= mx && x < right && y >= my && y < bottom)
+}
+
+fn resolve_startup_geometry(
+    saved: Option<SavedWindowState>,
+    monitors: &[MonitorRect],
+) -> StartupGeometry {
+    let Some(saved) = saved else {
+        return StartupGeometry::default();
+    };
+    // The plugin restores position to the pre-maximization rect for a
+    // maximized window (`prev_*`); a normal window uses its own rect.
+    let position = if saved.maximized {
+        (saved.prev_x, saved.prev_y)
+    } else {
+        (saved.x, saved.y)
+    };
+    let size = (saved.width, saved.height);
+    let monitor = monitors
+        .iter()
+        .find(|monitor| saved_rect_intersects_monitor(position, size, **monitor));
+    StartupGeometry {
+        size: (saved.width > 0 && saved.height > 0).then_some(size),
+        position: monitor.map(|_| position),
+        maximized: saved.maximized,
+        fullscreen: saved.fullscreen,
+        scale_factor: monitor.map(|m| m.4).unwrap_or(1.0),
+    }
+}
+
+/// The saved geometry for the plugin-state entry `label` (`"main"`, or
+/// `"secondary"` — the label the plugin's `map_label` assigns to every
+/// detached tab window).
+pub fn startup_geometry(app: &AppHandle, label: &str) -> StartupGeometry {
+    let saved = app
+        .path()
+        .app_config_dir()
+        .ok()
+        .and_then(|dir| {
+            fs::read_to_string(dir.join(tauri_plugin_window_state::DEFAULT_FILENAME)).ok()
+        })
+        .and_then(|json| parse_saved_window_state(&json, label));
+    let monitors = app
+        .available_monitors()
+        .map(|monitors| {
+            monitors
+                .iter()
+                .map(|m| {
+                    let (p, s) = (m.position(), m.size());
+                    (p.x, p.y, s.width, s.height, m.scale_factor())
+                })
+                .collect::<Vec<MonitorRect>>()
+        })
+        .unwrap_or_default();
+    resolve_startup_geometry(saved, &monitors)
+}
+
+/// Applies `geometry` to a window builder.
+///
+/// Maximization rides the builder only OFF Windows (tao `with_maximized` is
+/// side-effect free on a hidden window there); on Windows it is deferred to
+/// `show_window` — see `note_pending_quiet_maximize` — because tao's
+/// `with_maximized` is a post-creation `set_maximized`, the same
+/// `SW_MAXIMIZE` → `SW_HIDE` flash + activation as the plugin's. The
+/// size/position set alongside become the maximized window's restore rect;
+/// the builder takes logical units, so the saved physical values convert
+/// through `scale_factor`.
+///
+/// A non-maximized window (and every window on Windows) is built at
+/// `default_size` and corrected by `apply_startup_geometry` afterwards.
+/// `center_when_unpositioned` centres it only when no saved position is
+/// going to be applied.
+pub fn with_startup_geometry<'a, R: tauri::Runtime, M: Manager<R>>(
+    builder: tauri::WebviewWindowBuilder<'a, R, M>,
+    geometry: &StartupGeometry,
+    default_size: (u32, u32),
+    center_when_unpositioned: bool,
+) -> tauri::WebviewWindowBuilder<'a, R, M> {
+    if geometry.maximized && cfg!(not(target_os = "windows")) {
+        let scale = geometry.scale_factor;
+        let (w, h) = geometry.size.unwrap_or(default_size);
+        let builder = builder
+            .inner_size(w as f64 / scale, h as f64 / scale)
+            .maximized(true);
+        return match geometry.position {
+            Some((x, y)) => builder.position(x as f64 / scale, y as f64 / scale),
+            None if center_when_unpositioned => builder.center(),
+            None => builder,
+        };
+    }
+    let builder = builder.inner_size(default_size.0 as f64, default_size.1 as f64);
+    if center_when_unpositioned && geometry.position.is_none() {
+        return builder.center();
+    }
+    builder
+}
+
+/// The half of the restore that needs a built window but must still precede
+/// any `show`. `set_size` / `set_position` / `set_fullscreen` are
+/// `SetWindowPos`-class calls that cannot reveal a hidden window — unlike
+/// `maximize()`, which is why maximization never happens here.
+///
+/// The builder owns the restore rect only where it also owns the
+/// maximization (off Windows). Elsewhere this applies the physical geometry
+/// itself — for a to-be-maximized window that IS the point: the rect set
+/// here is the one Windows restores to when the window is later
+/// unmaximized.
+pub fn apply_startup_geometry<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    geometry: &StartupGeometry,
+) {
+    let builder_owns_rect = geometry.maximized && cfg!(not(target_os = "windows"));
+    if !builder_owns_rect {
+        if let Some((width, height)) = geometry.size {
+            let _ = window.set_size(tauri::PhysicalSize::new(width, height));
+        }
+        if let Some((x, y)) = geometry.position {
+            let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+        }
+    }
+    if geometry.fullscreen {
+        let _ = window.set_fullscreen(true);
+    }
+}
+
+/// Registers that `label` must be maximized by `show_window` — after its
+/// quiet show, not at build time.
+///
+/// Windows-only: there, every tao path to maximization (`maximize()`,
+/// `with_maximized`, and even the quiet `show()` of a window whose flags
+/// hold MAXIMIZED) goes through `ShowWindow(SW_MAXIMIZE)`, which activates
+/// — a cold start would yank focus seconds after launch (#702). Off Windows
+/// the builder maximizes without side effects and this is a no-op.
+pub fn note_pending_quiet_maximize(app: &AppHandle, label: &str, geometry: &StartupGeometry) {
+    #[cfg(target_os = "windows")]
+    if geometry.maximized {
+        let state = app.state::<AppState>();
+        lock_recover(&state.pending_quiet_maximize).insert(label.to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (app, label, geometry);
+}
+
+/// Maximizes a shown window without activating it (Windows).
+///
+/// tao cannot do this: every one of its maximize paths ends in
+/// `ShowWindow(SW_MAXIMIZE)`, which activates. The naive alternative —
+/// setting the `WS_MAXIMIZE` style bit directly — leaves a half-state:
+/// `IsZoomed` reports true but the frame keeps its normal geometry, because
+/// only the ShowWindow family asks Windows to compute the maximized rect
+/// (all verified empirically against Win32, decorated and borderless).
+///
+/// The working recipe: make the window temporarily non-activatable with
+/// `WS_EX_NOACTIVATE`, then `ShowWindow(SW_SHOWMAXIMIZED)` — the geometry
+/// maximizes, the activation is refused, and the restore rect is untouched.
+/// The extended style is removed again immediately, in the same event-loop
+/// turn. tao learns about the maximization from the `WM_SIZE` this sends,
+/// which is what keeps its flag-driven `GWL_STYLE` rebuilds from stripping
+/// anything later.
+#[cfg(target_os = "windows")]
+fn quiet_maximize(window: &tauri::Window) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWMAXIMIZED,
+        WS_EX_NOACTIVATE,
+    };
+
+    let Ok(hwnd) = window.hwnd() else { return };
+    unsafe {
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle | WS_EX_NOACTIVATE.0 as isize);
+        let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
 pub fn pick_delivery_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     let viewers: Vec<tauri::WebviewWindow> = app
         .webview_windows()
@@ -585,14 +915,30 @@ pub fn handle_single_instance(app: &AppHandle, args: Vec<String>, cwd: String) {
 
 pub fn create_transfer_window(app: AppHandle, token: String) -> Result<(), String> {
     let label = format!("window-{token}");
-    #[allow(unused_mut)]
-    let mut builder =
+    // The plugin's disk file lags its in-memory cache until process exit
+    // (Moved/Resized/CloseRequested only touch the cache). Flush first, or a
+    // second detach in the same session would restore the geometry the last
+    // detached window had at the previous EXIT rather than where the user
+    // just left it.
+    let _ = app.save_window_state(
+        tauri_plugin_window_state::StateFlags::SIZE
+            | tauri_plugin_window_state::StateFlags::POSITION
+            | tauri_plugin_window_state::StateFlags::MAXIMIZED
+            | tauri_plugin_window_state::StateFlags::FULLSCREEN,
+    );
+    // Detached tab windows share one saved state entry — the plugin's
+    // `map_label` writes them all under "secondary", so that is the key to
+    // read back. Restored at builder time for the same reason as the main
+    // window: the plugin's create-time restore would show the empty window
+    // before its webview has loaded.
+    let geometry = startup_geometry(&app, "secondary");
+    let builder =
         tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
             .title("Markpad")
-            .inner_size(1000.0, 800.0)
             .min_inner_size(400.0, 300.0)
             .visible(false)
             .resizable(true);
+    let mut builder = with_startup_geometry(builder, &geometry, (1000, 800), false);
 
     #[cfg(target_os = "macos")]
     {
@@ -607,6 +953,10 @@ pub fn create_transfer_window(app: AppHandle, token: String) -> Result<(), Strin
         builder = builder.decorations(false);
     }
     let window = builder.build().map_err(|e| e.to_string())?;
+    // Registered only once the window exists: a failed build must not leave a
+    // label in the pending set behind.
+    note_pending_quiet_maximize(&app, &label, &geometry);
+    apply_startup_geometry(&window, &geometry);
     let _ = window.set_shadow(true);
     Ok(())
 }
@@ -1171,6 +1521,172 @@ mod tests {
         assert_eq!(left_behind, Vec::<String>::new());
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_geometry_tests {
+    use super::*;
+
+    fn monitor(x: i32, y: i32, w: u32, h: u32) -> MonitorRect {
+        (x, y, w, h, 1.0)
+    }
+
+    const FULL: &str = r#"{
+        "main": {
+            "width": 906, "height": 641,
+            "x": -8, "y": -8,
+            "prev_x": 100, "prev_y": 200,
+            "maximized": true, "visible": true,
+            "decorated": true, "fullscreen": false
+        }
+    }"#;
+
+    #[test]
+    fn a_full_entry_restores_every_field_and_ignores_foreign_ones() {
+        let saved = parse_saved_window_state(FULL, "main").unwrap();
+        assert_eq!((saved.width, saved.height), (906, 641));
+        assert_eq!((saved.prev_x, saved.prev_y), (100, 200));
+        assert!(saved.maximized);
+        assert!(!saved.fullscreen);
+        // `visible` / `decorated` are in the file but not in the mirror:
+        // a parse failure here would mean unknown fields stop being tolerated.
+    }
+
+    #[test]
+    fn a_maximized_window_restores_its_pre_maximization_position() {
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(FULL, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert_eq!(geometry.position, Some((100, 200)));
+        assert!(geometry.maximized);
+        assert_eq!(geometry.size, Some((906, 641)));
+    }
+
+    #[test]
+    fn a_normal_window_restores_its_own_position() {
+        let json = r#"{"main": {"width": 900, "height": 650, "x": 30, "y": 40, "prev_x": 100, "prev_y": 200}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert_eq!(geometry.position, Some((30, 40)));
+        assert!(!geometry.maximized);
+    }
+
+    #[test]
+    fn garbage_reads_as_no_saved_state() {
+        assert_eq!(parse_saved_window_state("not json", "main"), None);
+        assert_eq!(parse_saved_window_state(r#"["main"]"#, "main"), None);
+        assert_eq!(
+            parse_saved_window_state(r#"{"main": "nope"}"#, "main"),
+            None
+        );
+        assert_eq!(parse_saved_window_state(r#"{"other": {}}"#, "main"), None);
+        assert_eq!(
+            parse_saved_window_state(r#"{"main": {"width": "wide"}}"#, "main"),
+            None,
+            "a field of the wrong type discards the entry rather than guessing"
+        );
+    }
+
+    #[test]
+    fn missing_fields_fall_back_to_safe_defaults() {
+        let saved = parse_saved_window_state(r#"{"main": {"width": 906}}"#, "main").unwrap();
+        assert_eq!(saved.width, 906);
+        assert_eq!(saved.height, 0);
+        assert!(!saved.maximized);
+        assert!(!saved.fullscreen);
+    }
+
+    #[test]
+    fn no_saved_state_is_the_builder_default() {
+        let geometry = resolve_startup_geometry(None, &[monitor(0, 0, 1920, 1080)]);
+        assert_eq!(geometry, StartupGeometry::default());
+        assert_eq!(geometry.scale_factor, 1.0);
+    }
+
+    #[test]
+    fn a_position_on_a_disconnected_monitor_is_dropped_but_the_size_is_kept() {
+        let json = r#"{"main": {"width": 906, "height": 641, "x": 5000, "y": 5000}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert_eq!(geometry.position, None);
+        assert_eq!(geometry.size, Some((906, 641)));
+        assert_eq!(
+            geometry.scale_factor, 1.0,
+            "no monitor matched, so no scale either"
+        );
+    }
+
+    #[test]
+    fn a_rect_with_one_corner_on_a_monitor_is_kept() {
+        // The rect's top-left is off-screen to the left, its bottom-right is not.
+        let json = r#"{"main": {"width": 906, "height": 641, "x": -900, "y": 10}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert_eq!(geometry.position, Some((-900, 10)));
+    }
+
+    #[test]
+    fn a_zero_size_is_no_size() {
+        let json = r#"{"main": {"width": 0, "height": 0, "x": 30, "y": 40}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert_eq!(geometry.size, None);
+    }
+
+    #[test]
+    fn the_matched_monitors_scale_factor_rides_along_for_logical_conversion() {
+        let json = r#"{"main": {"width": 906, "height": 641, "x": 2000, "y": 30}}"#;
+        let monitors = [monitor(0, 0, 1920, 1080), (1920, 0, 2560, 1440, 1.5)];
+        let geometry = resolve_startup_geometry(parse_saved_window_state(json, "main"), &monitors);
+        assert_eq!(geometry.position, Some((2000, 30)));
+        assert_eq!(geometry.scale_factor, 1.5);
+    }
+
+    #[test]
+    fn fullscreen_is_restored_with_and_without_maximization() {
+        let json =
+            r#"{"main": {"width": 906, "height": 641, "x": 30, "y": 40, "fullscreen": true}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert!(geometry.fullscreen);
+        assert!(!geometry.maximized);
+        assert_eq!(geometry.position, Some((30, 40)));
+
+        let json = r#"{"main": {"width": 906, "height": 641, "x": 30, "y": 40, "prev_x": 10, "prev_y": 20, "maximized": true, "fullscreen": true}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert!(geometry.fullscreen);
+        assert!(geometry.maximized);
+        assert_eq!(geometry.position, Some((10, 20)));
+    }
+
+    #[test]
+    fn absurd_saved_values_cannot_wrap_the_intersection_math() {
+        // u32::MAX sizes and i32::MIN positions are not values the plugin
+        // writes, but the file is user-writable JSON: the corner math must
+        // not overflow (debug builds panic on it) nor pretend a
+        // monitor-covering rect is a corner hit.
+        let json = r#"{"main": {"width": 4294967295, "height": 4294967295, "x": -2147483648, "y": -2147483648}}"#;
+        let geometry = resolve_startup_geometry(
+            parse_saved_window_state(json, "main"),
+            &[monitor(0, 0, 1920, 1080)],
+        );
+        assert_eq!(geometry.position, None);
+        assert_eq!(geometry.size, Some((u32::MAX, u32::MAX)));
     }
 }
 

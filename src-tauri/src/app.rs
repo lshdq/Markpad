@@ -54,9 +54,21 @@ pub fn run() {
                     tauri_plugin_window_state::StateFlags::SIZE
                         | tauri_plugin_window_state::StateFlags::POSITION
                         | tauri_plugin_window_state::StateFlags::MAXIMIZED
-                        | tauri_plugin_window_state::StateFlags::VISIBLE
                         | tauri_plugin_window_state::StateFlags::FULLSCREEN,
                 )
+                // The plugin only SAVES for these windows; restoring moved to
+                // builder time (`window_runtime::startup_geometry`). Its
+                // create-time restore runs inline inside `build()` and ends in
+                // `show()` + `set_focus()`: an empty window on screen — and
+                // stolen focus — long before the frontend's `show_window` is
+                // meant to reveal it (#702), and its `maximize()` on a
+                // still-hidden window is a `SW_MAXIMIZE` → `SW_HIDE` flash on
+                // top. VISIBLE is dropped from the flags for the same reason:
+                // visibility is owned by `show_window`, and a window being
+                // closed (which is when the plugin saves) is always visible.
+                // The skip list takes the MAPPED label, after `map_label`.
+                .skip_initial_state("main")
+                .skip_initial_state("secondary")
                 // Detached tab windows share one saved state instead of
                 // accumulating a state entry per generated label.
                 .map_label(|label| {
@@ -72,14 +84,14 @@ pub fn run() {
             let args: Vec<String> = std::env::args().collect();
 
             let label = "main";
+            let geometry = window_runtime::startup_geometry(app.handle(), label);
 
-            let mut window_builder = tauri::WebviewWindowBuilder::new(
+            let window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 label,
                 tauri::WebviewUrl::App("index.html".into()),
             )
             .title("Markpad")
-            .inner_size(900.0, 650.0)
             .min_inner_size(400.0, 300.0)
             .visible(false)
             // Half of "a cold start does not steal focus"; the other half is
@@ -92,8 +104,10 @@ pub fn run() {
             // built visible, and this one is not.
             .focused(false)
             .resizable(true)
-            .shadow(false)
-            .center();
+            .shadow(false);
+
+            let mut window_builder =
+                window_runtime::with_startup_geometry(window_builder, &geometry, (900, 650), true);
 
             #[cfg(target_os = "macos")]
             {
@@ -109,6 +123,14 @@ pub fn run() {
             }
 
             let window = window_builder.build()?;
+
+            // The physical-geometry half of the restore — hidden-safe, unlike
+            // the plugin's create-time restore it replaces (see the plugin
+            // registration above).
+            window_runtime::apply_startup_geometry(&window, &geometry);
+            // Registered only once the window exists — see the note in
+            // `create_transfer_window`.
+            window_runtime::note_pending_quiet_maximize(app.handle(), label, &geometry);
 
             #[cfg(target_os = "macos")]
             {
