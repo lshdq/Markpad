@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import test from 'node:test';
 
 import { readSource, readSourceBytes } from './sourceTree.js';
 
 const merge = readSource('.opencode/skills/merge-upstream/SKILL.md');
 const deploy = readSource('.opencode/skills/local-build-deploy/SKILL.md');
+const requirements = readSource('docs/需求-Markpad上游合并与本地构建部署Skill.md');
+const cases = readSource('docs/测试用例-Markpad上游合并与本地构建部署Skill.md');
 
 function frontmatter(source: string): string {
 	const match = /^---\n([\s\S]*?)\n---\n/.exec(source);
@@ -119,8 +123,63 @@ test('skills preserve confirmation, updater and release boundaries', () => {
 	assert.match(deploy, /plugins\.updater\.pubkey/);
 	assert.match(merge, /不运行 `npm run release`/);
 	assert.match(deploy, /不运行 `npm run release`/);
-	assert.match(merge, /退出并重新启动 OpenCode/);
-	assert.match(deploy, /退出并重新启动 OpenCode/);
+});
+
+test('V2 discovery guidance checks the Markpad location and never requires restarting to activate skills', () => {
+	const forcedRestart = /(?:必须(?:提示用户)?|需要)\s*退出\s*并\s*重新\s*启动\s*OpenCode(?:\s*才能\s*生效)?|不会\s*热加载\s*修改后的项目级\s*skill/;
+	assert.match('需要退出并重新启动 OpenCode 才能生效', forcedRestart);
+	assert.match('必须提示用户退出并重新启动 OpenCode', forcedRestart);
+	for (const source of [merge, deploy, requirements, cases]) {
+		assert.doesNotMatch(source, forcedRestart);
+	}
+	for (const source of [merge, deploy]) {
+		assert.match(source, /在 Markpad 项目上下文核对 skill 的 ID 和加载内容/);
+		assert.match(source, /不把重启当作生效的前置条件/);
+	}
+	assert.match(cases, /首选动态验证（只读，不执行 skill 正文步骤）/);
+	assert.match(cases, /分别用 `skill` 工具按这两个 ID 只读加载/);
+	assert.match(cases, /`Base directory for this skill`/);
+	assert.match(cases, /API 返回空清单不等于当前会话无法加载 skill/);
+	assert.match(cases, /可选 API 诊断/);
+	assert.match(cases, /opencode api --standalone get \/api\/location/);
+	assert.match(cases, /opencode api --standalone get \/api\/skill/);
+	assert.match(cases, /\$skills\.location\.directory -ne \$root/);
+	assert.match(cases, /\$skills\.data \| Where-Object/);
+	assert.match(cases, /\$_\.id -cne \$id/);
+	assert.match(cases, /Resolve-Path -LiteralPath \$_\.path/);
+	assert.match(cases, /\$actualPath\.Path -eq \$expectedPath/);
+	assert.doesNotMatch(cases, /opencode debug skill/);
+});
+
+test('optional V2 API diagnostic rejects same-ID skills from other paths and empty lists', {
+	skip: process.platform !== 'win32' && 'documented PowerShell snippet targets Windows',
+}, () => {
+	const script = /\*\*可选 API 诊断\*\*[\s\S]*?```powershell\n([\s\S]*?)```/.exec(cases)?.[1];
+	assert.ok(script, 'optional API diagnostic has no PowerShell snippet');
+	const mergePath = resolve('.opencode/skills/merge-upstream/SKILL.md');
+	const deployPath = resolve('.opencode/skills/local-build-deploy/SKILL.md');
+	const entry = (id: string, path: string) => ({ id, path });
+	const run = (data: { id: string; path: string }[]) => {
+		const mock = `function opencode {\n  $global:LASTEXITCODE = 0\n  if ($args[-1] -eq '/api/location') { '{"directory":${JSON.stringify(process.cwd())}}' }\n  elseif ($args[-1] -eq '/api/skill') { $env:MOCK_SKILLS_JSON }\n  else { throw 'Unexpected OpenCode call' }\n}\n`;
+		return spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-Command', `${mock}${script}`], {
+			cwd: process.cwd(),
+			encoding: 'utf8',
+			env: { ...process.env, MOCK_SKILLS_JSON: JSON.stringify({ location: { directory: process.cwd() }, data }) },
+		});
+	};
+	const valid = [entry('merge-upstream', mergePath), entry('local-build-deploy', deployPath)];
+	const success = run(valid);
+	assert.equal(success.error, undefined);
+	assert.equal(success.status, 0, success.stderr);
+	for (const data of [
+		[entry('merge-upstream', deployPath), valid[1]],
+		[valid[0], entry('local-build-deploy', mergePath)],
+		[],
+	]) {
+		const failure = run(data);
+		assert.notEqual(failure.status, 0, 'wrong path or empty API list must not pass');
+		assert.match(failure.stderr, /OpenCode did not list the Markpad skill/);
+	}
 });
 
 test('all delivered text files use LF and have no trailing whitespace', () => {

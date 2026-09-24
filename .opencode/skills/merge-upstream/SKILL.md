@@ -255,4 +255,4 @@ if ($LASTEXITCODE -ne 0) { throw "git push origin master failed with exit code $
 
 ## 配置加载提示
 
-本 skill 文件被创建或更新后，交付者必须提示用户退出并重新启动 OpenCode。当前已运行的会话不会热加载修改后的项目级 skill。
+本 skill 文件被创建或更新后，在 Markpad 项目上下文核对 skill 的 ID 和加载内容；若当前会话仍使用旧内容，重新打开会话再验证。V2 文档未要求每次修改项目级 skill 都必须退出并重启 OpenCode，不把重启当作生效的前置条件。

@@ -40,7 +40,7 @@ Markpad 当前仓库是 `sftwrdotdev/Markpad` 的本地 fork，日常开发需�
 12. 不执行版本升级、提交、打标签、创建 GitHub release、触发发布工作流、发布 Chocolatey 或 Snap 包。
 13. 不修改 Markpad 应用源码、构建脚本、updater endpoint 或 updater 公钥。
 14. skill 仅面向当前 Windows x64 本机环境；跨平台发布继续以 `RELEASING.md` 和 GitHub Actions 为准。
-15. `.opencode` 配置在 OpenCode 启动时加载；skill 创建后需要退出并重新启动 OpenCode 才能生效。
+15. skill 创建或更新后，应在 Markpad 项目上下文验证技能可发现性与加载内容；不能把其他工作区的 skill 列表视为本项目结果，不要求每次改动都重启 OpenCode。
 
 ## 输入输出
 
@@ -88,4 +88,4 @@ Markpad 当前仓库是 `sftwrdotdev/Markpad` 的本地 fork，日常开发需�
 11. `local-build-deploy` 把替换、校验和冒烟置于统一异常处理内，包含部署失败回滚及恢复哈希复核。
 12. 两个 skill 均明确不执行发版、版本升级、标签、GitHub release 或包管理器发布。
 13. 新增 Markdown 文件符合仓库 LF 约束，持久化契约测试和 `git diff --check` 通过。
-14. 创建 skill 后提示用户重启 OpenCode。
+14. 创建 skill 后按 V2 项目上下文验证步骤核对两个 ID；若动态查询无法确认，应报告未验证而非推断已加载。

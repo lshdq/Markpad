@@ -158,10 +158,10 @@
 - 预期结果：不会升级版本、提交、打标签、创建 release、触发 `build.yml`、发布 Chocolatey 或 Snap 包，也不会修改 updater endpoint 或公钥。
 - 优先级：P0
 
-### TC-026: OpenCode 重启提示存在
+### TC-026: OpenCode 项目上下文加载提示
 - 前置条件：skill 文件已创建。
 - 操作步骤：检查完成说明。
-- 预期结果：明确提示退出并重新启动 OpenCode，使项目级 skill 生效。
+- 预期结果：要求在 Markpad 项目上下文核对 skill 的 ID 和加载内容；未验证时不得断言已生效，不将重启作为必需前置条件。
 - 优先级：P1
 
 ## 测试命令
@@ -173,10 +173,39 @@ git diff --check
 git status --short
 git diff -- docs/ .opencode/skills/
 node --test --import tsx scripts/opencodeSkills.test.ts
-opencode debug skill
 ```
 
-`scripts/opencodeSkills.test.ts` 直接读取两个 skill，因此即使文件尚未被 Git 跟踪，也会验证 frontmatter、触发词、固定 SHA、原生命令退出码、目标架构、互斥锁、事务回滚、安全门禁和禁止行为。`opencode debug skill` 负责验证新进程能实际加载 skill。
+`scripts/opencodeSkills.test.ts` 直接读取两个 skill，因此即使文件尚未被 Git 跟踪，也会验证 frontmatter、触发词、固定 SHA、原生命令退出码、目标架构、互斥锁、事务回滚、安全门禁和禁止行为。
+
+**首选动态验证（只读，不执行 skill 正文步骤）**：在工作目录确认为 Markpad 仓库根目录的 OpenCode 会话中，检查会话提供的可用 skill 列表是否包含 `merge-upstream` 和 `local-build-deploy`；再分别用 `skill` 工具按这两个 ID 只读加载。检查返回的 `Base directory for this skill` 分别为本仓库的 `.opencode/skills/merge-upstream` 和 `.opencode/skills/local-build-deploy`，核对正文标题与安全规则。若任一 ID 不可用、加载失败、基目录不是当前 Markpad 仓库，报告未验证，不触发合并、构建或部署。本次 Markpad 会话的两个 ID 均已在 `available_skills` 显示，且 `skill` 工具加载后的基目录均为本仓库对应目录。
+
+**可选 API 诊断**：从 Markpad 仓库根目录执行下列只读查询。V2 `/api/skill` 响应包含 `location`、`data`；`data` 中的 `Skill.Info` 含 `id` 和 `path`（见 [V2 API 规范](https://opencode.ai/v2/openapi.json)）。`--standalone` 避开当前可能属于其他项目的共享服务，并分别检查两个响应的 location。只有两个目标 ID 的条目各自 `path` 都能解析到本仓库对应的 `SKILL.md`，才认定 API 清单验证通过；同 ID 被全局或显式 skill 覆盖不能算通过。API 返回空清单不等于当前会话无法加载 skill，不把下面的脚本当作唯一或强制验证方法；如与 `skill` 工具结果不一致，分别记录结果和版本，不猜测根因。
+
+```powershell
+$root = (Resolve-Path -LiteralPath (git rev-parse --show-toplevel)).Path
+if ($LASTEXITCODE -ne 0 -or (Get-Location).Path -ne $root) { throw 'Run from the Markpad repository root' }
+foreach ($id in @('merge-upstream', 'local-build-deploy')) {
+    if (-not (Test-Path -LiteralPath ".opencode/skills/$id/SKILL.md" -PathType Leaf)) { throw "Missing Markpad skill: $id" }
+}
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+chcp 65001 | Out-Null
+$location = opencode api --standalone get /api/location | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or $location.directory -ne $root) { throw 'OpenCode location is not the Markpad repository root' }
+$skills = opencode api --standalone get /api/skill | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or $skills.location.directory -ne $root) { throw 'Skill list is not from the Markpad repository root' }
+foreach ($id in @('merge-upstream', 'local-build-deploy')) {
+    $expectedPath = (Resolve-Path -LiteralPath ".opencode/skills/$id/SKILL.md").Path
+    $matching = @($skills.data | Where-Object {
+        if ($_.id -cne $id -or $_.path -isnot [string]) { return $false }
+        $actualPath = Resolve-Path -LiteralPath $_.path -ErrorAction SilentlyContinue
+        $null -ne $actualPath -and $actualPath.Path -eq $expectedPath
+    })
+    if ($matching.Count -ne 1) { throw "OpenCode did not list the Markpad skill at $expectedPath : $id" }
+}
+```
+
+当前 Windows CLI v2.0.16 在该 `--standalone` location 下返回 `data: []`，所以上述可选 API 清单验证目前不通过；这与本项目会话 `skill` 工具已加载两项 skill 的结果分别记录。若 CLI/API 无法列出项目 skill，按 [V2 Skills 排障指引](https://opencode.ai/v2/docs/skills#troubleshooting)检查目录、重复 ID 和权限，不要误报 API 清单通过；V2 CLI 可用子命令以 `opencode --help`、`opencode api --help` 为准。
 
 本次文档验证阶段不执行以下具有副作用的命令：
 
